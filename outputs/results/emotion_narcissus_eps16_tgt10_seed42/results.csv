@@ -1,0 +1,3 @@
+epochs,Poisoned training ACC,Poisoned training ASR,Batch-level |features|
+30,0.7903591070850857,0.8505338078291815,
+10,,,5060
