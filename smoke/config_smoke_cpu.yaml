@@ -1,0 +1,65 @@
+exp: smoke_cpu
+attack: "narcissus"
+dataset: "caltech256"
+model: "ResNet18"
+
+# path created by smoke_data_gen.py
+dataset_dir: "./smoke_data"
+
+eps: 16
+pr_tgt: 50          # 50 % of target-class images poisoned (ensures ≥1 even in tiny dataset)
+pr_sus: 50
+target_class: 0
+source_class: 0
+
+saved_models_path: "./smoke_out/"
+clean_model_path:     "./smoke_out/clean_model.pkl"
+poisoned_model_path:  "./smoke_out/poisoned_model.pkl"
+retrained_model_path: "./smoke_out/retrained_model.pkl"
+
+# ---------- main training ----------
+epochs: 1
+bs: 8
+lr: 0.01
+opt: "sgd"
+
+# ---------- provenance capture ----------
+ep_bl: 1
+ep_bl_base: 1
+ep_sl: 1
+ep_sl_base: 1
+bs_bl: 8
+bs_sl: 8
+
+# ---------- Narcissus trigger generation ----------
+img_size: 32          # small images → fast on CPU
+surrogate_epochs: 1
+gen_steps: 3
+
+# ---------- misc ----------
+gpu_id: 0             # ignored on CPU (M1 guard falls back automatically)
+global_seed: 42
+scenario: "from_scratch"
+
+clean_training: false
+poisoned_training: true
+batch_level: true
+sample_level: true
+score_samples: true
+retrain: true
+
+results_path: "./smoke_out/results/"
+prov_path:    "./smoke_out/prov/"
+
+vis: false
+get_result: false
+force: true
+
+threshold_type: "Kmeans"
+k_1: 1
+k_2: 0.0001
+custom_threshold: 0.5
+cv_model: "RandomForest"
+groups: 2             # reduced from 5 — tiny dataset can't support 5 CV folds
+random: false
+sample_from_test: false

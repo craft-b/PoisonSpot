@@ -1,0 +1,2256 @@
+diff --git a/main.py b/main.py
+index 3c70e50dd..65703fceb 100644
+--- a/main.py
++++ b/main.py
+@@ -1,3 +1,5 @@
++import torch
++import torch.nn as nn
+ 
+ """
+ PoisonSpot: Precise Spotting of Clean-Label Backdoors via Fine-Grained Training Provenance Tracking
+@@ -28,9 +30,12 @@ import json
+ import shutil
+ warnings.filterwarnings("ignore")
+ 
+-import tensorflow as tf                                        
+-tf.compat.v1.disable_eager_execution()
+-tf.get_logger().setLevel("ERROR")
++try:
++    import tensorflow as tf
++    tf.compat.v1.disable_eager_execution()
++    tf.get_logger().setLevel("ERROR")
++except Exception:
++    tf = None
+ 
+ 
+ def parse_args() -> argparse.Namespace:
+@@ -78,8 +83,8 @@ def main() -> None:
+         f"Suspected %: {cfg.pr_sus}"
+     )
+ 
+-    device = torch.device(f"cuda:{cfg.gpu_id}")
+-    print(f"Using GPU {cfg.gpu_id}")
++    device = torch.device(f"cuda:{cfg.gpu_id}" if torch.cuda.is_available() else "cpu")
++    print(f"Using {'GPU ' + str(cfg.gpu_id) if torch.cuda.is_available() else 'CPU'}")
+ 
+     # models
+     if cfg.model == "ResNet18":
+@@ -231,6 +236,32 @@ def main() -> None:
+         else:
+             raise ValueError(f"Attack {cfg.attack} not supported on SLT10")
+ 
++
++    elif cfg.dataset == "caltech256":
++        # get_narcissus_caltech256_poisoned_data handles dataset loading,
++        # model-head replacement (in-place on orig_model), train/test split,
++        # surrogate training, trigger generation, and dataset poisoning.
++        if cfg.attack == "narcissus":
++            poisoned_train_dataset, test_dataset, poisoned_test_dataset, poison_indices = \
++                get_narcissus_caltech256_poisoned_data(
++                    cfg.pr_tgt,
++                    cfg.target_class,
++                    cfg.dataset_dir,
++                    orig_model,        # fc replaced in-place
++                    cfg.eps,
++                    cfg.global_seed,
++                    img_size=getattr(cfg, "img_size", 112),
++                    surrogate_epochs=getattr(cfg, "surrogate_epochs", 5),
++                    gen_steps=getattr(cfg, "gen_steps", 200),
++                    batch_size=cfg.bs,
++                    device=device,
++                )
++        else:
++            raise ValueError(
++                f"Attack '{cfg.attack}' not yet supported on caltech256. "
++                f"Supported: narcissus"
++            )
++
+     elif cfg.dataset == "imagenet":
+         if cfg.attack == "ht":
+             poisoned_train_dataset, test_dataset, poisoned_test_dataset, poison_indices = \
+@@ -258,6 +289,28 @@ def main() -> None:
+         else:
+             raise ValueError(f"Attack {cfg.attack} not supported on ImageNet")
+ 
++
++    elif cfg.dataset == "emotion":
++        if cfg.attack == "narcissus":
++            poisoned_train_dataset, test_dataset, poisoned_test_dataset, poison_indices = \
++                get_narcissus_emotion_poisoned_data(
++                    cfg.pr_tgt,
++                    cfg.target_class,
++                    cfg.dataset_dir,
++                    orig_model,        # fc replaced in-place
++                    cfg.eps,
++                    cfg.global_seed,
++                    img_size=getattr(cfg, "img_size", 112),
++                    surrogate_epochs=getattr(cfg, "surrogate_epochs", 5),
++                    gen_steps=getattr(cfg, "gen_steps", 200),
++                    batch_size=cfg.bs,
++                    device=device,
++                )
++        else:
++            raise ValueError(
++                f"Attack '{cfg.attack}' not yet supported on emotion. "
++                f"Supported: narcissus"
++            )
+     else:
+         raise ValueError(f"Dataset {cfg.dataset} not recognized")  
+     
+@@ -368,23 +421,23 @@ def main() -> None:
+         if cfg.get_result:
+ 
+             ckpt = (
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"clean_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.epochs}.pkl"
+             )
+             model.load_state_dict(torch.load(ckpt))
+-            test_ACC = evaluate_model(model, test_loader, poisoned_test_loader, criterion, device)
+-            
+-            csv_file = init_experiment_folder(cfg)   
++            _, test_ACC = evaluate_model(model, test_loader, device)  # M2 fix
++
++            csv_file = init_experiment_folder(cfg)
+             update_results(
+                 csv_file,
+                 epochs=cfg.epochs,
+                 **{
+-                    "Clean training ACC": test_ACC,
++                    "Clean training ACC": float(test_ACC),
+                 }
+             )
+         else:
+             # train & save
+-            model, optimizer, scheduler, test_ASR, test_ACC = train(
++            model, optimizer, scheduler, test_ASR, test_ACC, _c, _t = train(
+                 model,
+                 optimizer,
+                 cfg.opt,
+@@ -396,10 +449,9 @@ def main() -> None:
+                 cfg.epochs,
+                 cfg.global_seed,
+                 device,
+-                cfg.training_mode,
+             )
+             ckpt = (
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"clean_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.epochs}.pkl"
+             )
+             torch.save(model.state_dict(), ckpt)
+@@ -409,7 +461,7 @@ def main() -> None:
+                 csv_file,
+                 epochs=cfg.epochs,
+                 **{
+-                    "Clean training ACC": test_ACC[-1],
++                    "Clean training ACC": float(test_ACC),
+                 }
+             )
+ 
+@@ -445,14 +497,15 @@ def main() -> None:
+         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+ 
+         ckpt = (
+-            f"{cfg.saved_models_path}"
++            f"{cfg.saved_models_path}/"
+             f"model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.epochs}_{cfg.bs}.pkl"
+         )
+ 
+         if cfg.get_result:
+             # Load and evaluate
+             model.load_state_dict(torch.load(ckpt))
+-            test_ASR, test_ACC = evaluate_model(model, test_loader, poisoned_test_loader, criterion, device)
++            _, test_ACC = evaluate_model(model, test_loader, device)           # M3 fix
++            _, test_ASR = evaluate_model(model, poisoned_test_loader, device)  # M3 fix
+             
+             if cfg.attack in {"narcissus_lc"}:
+                 csv_file = init_experiment_folder(cfg)   
+@@ -460,9 +513,9 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Poisoned training ASR Narcissus": test_ASR[-1],
++                        "Poisoned training ASR Narcissus": float(test_ASR),
+                         "Poisoned training ASR Label Consistent": test_ASR[-2],
+-                        "Poisoned training ACC": test_ACC[-1],
++                        "Poisoned training ACC": float(test_ACC),
+                     }
+                 )
+             elif cfg.attack in {"narcissus_lc_sa"}:
+@@ -471,10 +524,10 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Poisoned training ASR Narcissus": test_ASR[-1],
++                        "Poisoned training ASR Narcissus": float(test_ASR),
+                         "Poisoned training ASR Label Consistent": test_ASR[-2],
+                         "Poisoned training ASR Sleeper Agent": test_ASR[-3],
+-                        "Poisoned training ACC": test_ACC[-1],
++                        "Poisoned training ACC": float(test_ACC),
+                     }
+                 )
+             else:
+@@ -484,13 +537,13 @@ def main() -> None:
+                     epochs=cfg.epochs,
+                     **{
+                         "Poisoned training ACC": test_ACC,
+-                        "Poisoned training ASR": test_ASR[-1],
++                        "Poisoned training ASR": float(test_ASR),
+                     }
+                 )
+             
+         else:
+             # Train and save
+-            model, optimizer, scheduler, test_ASR, test_ACC= train(
++            model, optimizer, scheduler, test_ASR, test_ACC, _c, _t = train(
+                 model,
+                 optimizer,
+                 cfg.opt,
+@@ -502,17 +555,16 @@ def main() -> None:
+                 cfg.epochs,
+                 cfg.global_seed,
+                 device,
+-                cfg.training_mode,
+             )
+             torch.save(model.state_dict(), ckpt)
+             torch.save(
+                 optimizer.state_dict(),
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"optimizer_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.epochs}_{cfg.bs}.pkl",
+             )
+             torch.save(
+                 scheduler.state_dict(),
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"scheduler_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.epochs}_{cfg.bs}.pkl",
+             )
+ 
+@@ -522,9 +574,9 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Poisoned training ASR Narcissus": test_ASR[-1],
++                        "Poisoned training ASR Narcissus": float(test_ASR),
+                         "Poisoned training ASR Label Consistent": test_ASR[-2],
+-                        "Poisoned training ACC": test_ACC[-1],
++                        "Poisoned training ACC": float(test_ACC),
+                     }
+                 )
+             elif cfg.attack in {"narcissus_lc_sa"}:
+@@ -533,10 +585,10 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Poisoned training ASR Narcissus": test_ASR[-1],
++                        "Poisoned training ASR Narcissus": float(test_ASR),
+                         "Poisoned training ASR Label Consistent": test_ASR[-2],
+                         "Poisoned training ASR Sleeper Agent": test_ASR[-3],
+-                        "Poisoned training ACC": test_ACC[-1],
++                        "Poisoned training ACC": float(test_ACC),
+                     }
+                 )
+             else:
+@@ -545,8 +597,8 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Poisoned training ACC": test_ACC[-1],
+-                        "Poisoned training ASR": test_ASR[-1],
++                        "Poisoned training ACC": float(test_ACC),
++                        "Poisoned training ASR": float(test_ASR),
+                     }
+                 )
+         
+@@ -556,7 +608,8 @@ def main() -> None:
+             test_dataset,
+             poisoned_test_dataset,
+             cfg.bs_bl,
+-            cfg.target_class
++            cfg.target_class,
++            poison_indices,  # M8 fix: was missing
+         )
+         model = copy.deepcopy(orig_model).to(device)
+ 
+@@ -583,15 +636,15 @@ def main() -> None:
+ 
+         if cfg.ep_bl_base > 0:
+             model_path = (
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.ep_bl_base}_{cfg.bs_bl}.pkl"
+             )
+             optimizer_path = (
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"optimizer_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.ep_bl_base}_{cfg.bs_bl}.pkl"
+             )
+             scheduler_path = (
+-                f"{cfg.saved_models_path}"
++                f"{cfg.saved_models_path}/"
+                 f"scheduler_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.ep_bl_base}_{cfg.bs_bl}.pkl"
+             )
+ 
+@@ -607,7 +660,7 @@ def main() -> None:
+                 print(f"Loaded model trained for {cfg.ep_bl_base} epochs from saved files")
+             else:
+                 print(f"Training model for {cfg.ep_bl_base} epochs before capturing batch‐level updates...")
+-                model, optimizer, scheduler, test_ASR, test_ACC = train(
++                model, optimizer, scheduler, test_ASR, test_ACC, _c, _t = train(
+                     model,
+                     optimizer,
+                     cfg.opt,
+@@ -619,7 +672,6 @@ def main() -> None:
+                     cfg.ep_bl_base,
+                     cfg.global_seed,
+                     device,
+-                    cfg.training_mode
+                 )
+                 torch.save(model.state_dict(), model_path)
+                 torch.save(optimizer.state_dict(), optimizer_path)
+@@ -664,8 +716,7 @@ def main() -> None:
+             cfg.attack,
+             device,
+             cfg.global_seed,
+-            cfg.results_path  + cfg.exp,
+-            cfg.training_mode,
++            os.path.join(cfg.results_path, cfg.exp),  # M4 fix: was missing /
+             k=cfg.k_1
+         )
+ 
+@@ -693,7 +744,8 @@ def main() -> None:
+             test_dataset,
+             poisoned_test_dataset,
+             cfg.bs_sl,
+-            cfg.target_class
++            cfg.target_class,
++            poison_indices,  # M8 fix: was missing
+         )
+ 
+         model = copy.deepcopy(orig_model).to(device)
+@@ -720,17 +772,17 @@ def main() -> None:
+         )
+ 
+         model_path = (
+-            f"{cfg.saved_models_path}"
++            f"{cfg.saved_models_path}/"
+             f"model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_"
+             f"{cfg.pr_tgt}_{cfg.ep_sl_base}_{cfg.bs_bl}.pkl"
+         )
+         optimizer_path = (
+-            f"{cfg.saved_models_path}"
++            f"{cfg.saved_models_path}/"
+             f"optimizer_{cfg.attack}_{cfg.dataset}_{cfg.eps}_"
+             f"{cfg.pr_tgt}_{cfg.ep_sl_base}_{cfg.bs_bl}.pkl"
+         )
+         scheduler_path = (
+-            f"{cfg.saved_models_path}"
++            f"{cfg.saved_models_path}/"
+             f"scheduler_{cfg.attack}_{cfg.dataset}_{cfg.eps}_"
+             f"{cfg.pr_tgt}_{cfg.ep_sl_base}_{cfg.bs_bl}.pkl"
+         )
+@@ -748,7 +800,7 @@ def main() -> None:
+                 print(f"Loaded model trained for {cfg.ep_sl_base} epochs")
+             else:
+                 print(f"Training for {cfg.ep_sl_base} epochs before capturing sample‐level updates...")
+-                model, optimizer, scheduler, train_ACC, test_ACC, clean_ACC, target_ACC = train(
++                model, optimizer, scheduler, target_ACC, test_ACC, train_ACC, clean_ACC = train(
+                     model,
+                     optimizer,
+                     cfg.opt,
+@@ -760,7 +812,6 @@ def main() -> None:
+                     cfg.ep_sl_base,
+                     cfg.global_seed,
+                     device,
+-                    cfg.training_mode
+                 )
+                 torch.save(model.state_dict(), model_path)
+                 torch.save(optimizer.state_dict(), optimizer_path)
+@@ -783,7 +834,7 @@ def main() -> None:
+         feats_path = (
+             f"{cfg.prov_path}"
+             f"important_features_single_{cfg.attack}_{cfg.dataset}_{cfg.eps}_"
+-            f"{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.bs_sl}_k_1.pkl"
++            f"{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.bs_bl}_k_{cfg.k_1}.pkl"
+         )
+         with open(feats_path, "rb") as f:
+             important_features = pickle.load(f)
+@@ -816,7 +867,6 @@ def main() -> None:
+             device,
+             cfg.global_seed,
+             cfg.results_path,
+-            cfg.training_mode,
+             k=cfg.k_1,
+         )
+         print(
+@@ -826,7 +876,7 @@ def main() -> None:
+ 
+         # Save the results
+         base = (
+-            f"{cfg.prov_path}"
++            f"{cfg.prov_path}/"
+             f"sus_diff_single_{cfg.attack}_{cfg.dataset}_{cfg.eps}_"
+             f"{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.bs_sl}_{cfg.ep_sl}_"
+             f"{cfg.ep_sl_base}_sample_level_idv_k_1_aug_z_1.pkl"
+@@ -991,11 +1041,12 @@ def main() -> None:
+         if cfg.get_result:
+             model.load_state_dict(
+                 torch.load(
+-                    cfg.saved_models_path
+-                    + f"retrained_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.epochs}.pkl"
++                    f"{cfg.saved_models_path}/"  # M5 fix: added /
++                    f"retrained_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.epochs}.pkl"
+                 )
+             )
+-            test_ACC, test_ASR = evaluate_model(model, test_loader, poisoned_test_loader, criterion, device)
++            _, test_ACC = evaluate_model(model, test_loader, device)           # M6 fix
++            _, test_ASR = evaluate_model(model, poisoned_test_loader, device)  # M6 fix
+             
+             if cfg.attack in {"narcissus_lc"}:
+                 csv_file = init_experiment_folder(cfg)   
+@@ -1003,7 +1054,7 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Retrain ASR Narcissus": test_ASR[-1],
++                        "Retrain ASR Narcissus": float(test_ASR),
+                         "Retrain ASR Label Consistent": test_ASR[-2],
+                         "Retrain ACC": test_ACC,
+                     }
+@@ -1014,7 +1065,7 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Retrain ASR Narcissus": test_ASR[-1],
++                        "Retrain ASR Narcissus": float(test_ASR),
+                         "Retrain ASR Label Consistent": test_ASR[-2],
+                         "Retrain ASR Sleeper Agent": test_ASR[-3],
+                         "Retrain ACC": test_ACC,
+@@ -1027,12 +1078,12 @@ def main() -> None:
+                     epochs=cfg.epochs,
+                     **{
+                         "Retrain ACC": test_ACC,
+-                        "Retrain ASR": test_ASR[-1],
++                        "Retrain ASR": float(test_ASR),
+                     }
+                 )
+             
+         else:
+-            model, optr, slr, test_ASR, test_ACC = train(
++            model, optr, slr, test_ASR, test_ACC, _c, _t = train(
+                 model,
+                 optimizer,
+                 cfg.opt,
+@@ -1044,12 +1095,11 @@ def main() -> None:
+                 cfg.epochs,
+                 cfg.global_seed,
+                 device,
+-                cfg.training_mode,
+             )
+             torch.save(
+                 model.state_dict(),
+-                cfg.saved_models_path
+-                + f"retrained_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.epochs}.pkl",
++                f"{cfg.saved_models_path}/"  # M7 fix: added /
++                f"retrained_model_{cfg.attack}_{cfg.dataset}_{cfg.eps}_{cfg.pr_tgt}_{cfg.pr_sus}_{cfg.epochs}.pkl",
+             )
+ 
+         
+@@ -1059,7 +1109,7 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Retrain ASR Narcissus": test_ASR[-1],
++                        "Retrain ASR Narcissus": float(test_ASR),
+                         "Retrain ASR Label Consistent": test_ASR[-2],
+                         "Retrain ACC": test_ACC,
+                     }
+@@ -1070,7 +1120,7 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Retrain ASR Narcissus": test_ASR[-1],
++                        "Retrain ASR Narcissus": float(test_ASR),
+                         "Retrain ASR Label Consistent": test_ASR[-2],
+                         "Retrain ASR Sleeper Agent": test_ASR[-3],
+                         "Retrain ACC": test_ACC,
+@@ -1082,8 +1132,8 @@ def main() -> None:
+                     csv_file,
+                     epochs=cfg.epochs,
+                     **{
+-                        "Retrain ACC": test_ACC[-1],
+-                        "Retrain ASR": test_ASR[-1],
++                        "Retrain ACC": float(test_ACC),
++                        "Retrain ASR": float(test_ASR),
+                     }
+                 )
+ 
+diff --git a/src/__init__.py b/src/__init__.py
+index 16839a54c..91eb61732 100644
+--- a/src/__init__.py
++++ b/src/__init__.py
+@@ -1,39 +1,24 @@
+-# src/__init__.py
+-# ---------------
++# src/__init__.py  (patched -- SA/HT/mixed/LC imports removed; not needed for Narcissus-Caltech256)
+ 
+-# attacks
+-from .attacks.Labelconsistent.generate_poison_lc import (
+-    get_lc_cifar10_poisoned_data,
+-    get_lc_image_net_poisoned_data,
+-)
+ from .attacks.Narcissus.generate_poison_narcissus import (
+     get_narcissus_cifar10_poisoned_data,
+ )
+-from .attacks.Sleeperagent.generate_poison_sa import (
+-    get_sa_cifar10_poisoned_data,
+-    get_sa_slt_10_poisoned_data,
+-)
+-from .attacks.HiddenTriggerBackdoor.generate_poison_hidden_trigger import (
+-    get_ht_cifar10_poisoned_data,
+-    get_ht_stl10_poisoned_data,
+-    get_ht_imagenet_poisoned_data,
+-)
+-from .attacks.mixed.mixed_attacks import (
+-    get_lc_narcissus_cifar_10_poisoned_data,
+-    get_lc_narcissus_sa_cifar_10_poisoned_data,
+-)
+ 
+ # models
+ from .models.resnet import ResNet
+ from .models.custom_resnet18 import CustomResNet18
+ from .models.dnn import DNN
+ from .models.custom_cnn import CustomCNN
+-from .models.custom_vit import CustomViT
++try:
++    from .models.custom_vit import CustomViT
++except Exception:
++    CustomViT = None
+ 
+ # utils
+ from .utils.util import AverageMeter
+ 
+-from .helpers.data import get_loaders_from_dataset, get_random_poison_idx
++# FIX I1: added get_narcissus_caltech256_poisoned_data to this import
++from .helpers.data import get_loaders_from_dataset, get_random_poison_idx, get_narcissus_caltech256_poisoned_data, get_narcissus_emotion_poisoned_data
+ from .helpers.train import train, evaluate_model
+ from .helpers.provenance import (
+     capture_first_level_multi_epoch_batch_sample_weight_updates,
+@@ -43,16 +28,9 @@ from .helpers.scoring import train_prov_data_custom, score_poisoned_samples, get
+ 
+ __all__ = [
+     # attacks
+-    "get_lc_cifar10_poisoned_data",
+-    "get_lc_image_net_poisoned_data",
+     "get_narcissus_cifar10_poisoned_data",
+-    "get_sa_cifar10_poisoned_data",
+-    "get_sa_slt_10_poisoned_data",
+-    "get_ht_cifar10_poisoned_data",
+-    "get_ht_stl10_poisoned_data",
+-    "get_ht_imagenet_poisoned_data",
+-    "get_lc_narcissus_cifar_10_poisoned_data",
+-    "get_lc_narcissus_sa_cifar_10_poisoned_data",
++    "get_narcissus_caltech256_poisoned_data",
++    "get_narcissus_emotion_poisoned_data",
+ 
+     # models
+     "ResNet",
+@@ -80,4 +58,4 @@ __all__ = [
+     "train_prov_data_custom",
+     "score_poisoned_samples",
+     "get_diff",
+-]
+\ No newline at end of file
++]
+diff --git a/src/helpers/data.py b/src/helpers/data.py
+index cdb06a106..b6e1d9687 100644
+--- a/src/helpers/data.py
++++ b/src/helpers/data.py
+@@ -1,63 +1,642 @@
++import copy
+ import torch
++import torch.nn as nn
++import torch.nn.functional as F
+ from torch.utils.data import DataLoader, Subset
+ import numpy as np
+ import random
+ 
+-__all__ = ["get_loaders_from_dataset", "get_random_poison_idx"]
++__all__ = [
++    "get_loaders_from_dataset",
++    "get_random_poison_idx",
++    "get_narcissus_caltech256_poisoned_data",
++    "get_narcissus_emotion_poisoned_data",
++]
++
++
++# ---------------------------------------------------------------------------
++# Dataset wrappers
++# ---------------------------------------------------------------------------
++
++class _IndexedDataset(torch.utils.data.Dataset):
++    """
++    Adds the positional index as a 3rd return value for datasets that yield
++    only 2-tuples (img, label).  Datasets already returning 3-tuples are
++    passed through unchanged.
++    """
++    def __init__(self, base):
++        self.base = base
++
++    def __len__(self):
++        return len(self.base)
++
++    def __getitem__(self, idx):
++        sample = self.base[idx]
++        if len(sample) >= 3:
++            return sample
++        return sample[0], sample[1], idx
++
++
++class _PoisonedDataset(torch.utils.data.Dataset):
++    """
++    Wraps a clean dataset and applies a fixed trigger tensor to a specified
++    set of positional indices.
++
++    Args:
++        base           : base dataset (returns 2-tuples)
++        poison_indices : list/set of positional indices to poison
++        trigger        : CPU tensor of shape [C, H, W]; added to the image
++        clamp_min/max  : values to clamp the poisoned image to (normalised space)
++    """
++    def __init__(self, base, poison_indices, trigger, clamp_min=-3.0, clamp_max=3.0):
++        self.base        = base
++        self.poison_set  = set(int(i) for i in poison_indices)
++        self.trigger     = trigger          # [C, H, W] on CPU
++        self.clamp_min   = clamp_min
++        self.clamp_max   = clamp_max
++
++    def __len__(self):
++        return len(self.base)
++
++    def __getitem__(self, idx):
++        img, label = self.base[idx]
++        if idx in self.poison_set:
++            img = torch.clamp(img + self.trigger, self.clamp_min, self.clamp_max)
++        return img, label
++
++
++# ---------------------------------------------------------------------------
++# Label helper (avoids iterating full dataset for label-only access)
++# ---------------------------------------------------------------------------
++
++def _get_labels(ds):
++    """
++    Return a list of integer labels for dataset ds without loading all images.
++    Handles ImageFolder (.targets), Subset (.indices), and the wrappers above.
++    Falls back to full iteration if nothing faster is available.
++    """
++    if hasattr(ds, 'targets'):                          # ImageFolder / standard
++        return list(ds.targets)
++    if hasattr(ds, 'dataset') and hasattr(ds, 'indices'):  # Subset
++        base_labels = _get_labels(ds.dataset)
++        return [base_labels[i] for i in ds.indices]
++    if hasattr(ds, 'base'):                             # _PoisonedDataset / _IndexedDataset
++        return _get_labels(ds.base)
++    # Slow fallback
++    return [ds[i][1] for i in range(len(ds))]
++
++
++# ---------------------------------------------------------------------------
++# Core loader factory
++# ---------------------------------------------------------------------------
+ 
+ def get_loaders_from_dataset(
+     poisoned_train_dataset,
+-    test_dataset, 
+-    poisoned_test_dataset, 
+-    batch_size, target_class, 
+-    indexes_to_remove = []
+-    ):
+-    
+-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+-    if type(poisoned_test_dataset) == dict:
+-        poisoned_test_loader = {}
+-        for attack_name in poisoned_test_dataset:
+-            poisoned_test_loader[attack_name] = DataLoader(poisoned_test_dataset[attack_name], batch_size=batch_size, shuffle=False, num_workers=2)
+-    else:     
+-        poisoned_test_loader = DataLoader(poisoned_test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+-    
+-    if len(indexes_to_remove) > 0:
+-        print("Length of indexes to remove: ", len(indexes_to_remove))
+-        
+-        indices = [idx.item() if isinstance(idx, torch.Tensor) else idx for img, lbl, idx in poisoned_train_dataset]
+-
+-        print(len(set(indices) & set(indexes_to_remove)))
+-        indexes_to_keep = [i for i, idx in enumerate(indices) if idx not in indexes_to_remove]
+-        poisoned_train_dataset_filtered = Subset(poisoned_train_dataset, indexes_to_keep)
+-        target_class_indices = [idx for img, lbl, idx in poisoned_train_dataset_filtered if lbl == target_class]
+-        
+-        print("Length of the filtered dataset: ", len(poisoned_train_dataset_filtered))
+-        poisoned_train_loader = DataLoader(poisoned_train_dataset_filtered, batch_size=batch_size, shuffle=True, num_workers=2)
++    test_dataset,
++    poisoned_test_dataset,
++    batch_size,
++    target_class,
++    indexes_to_remove=None,
++):
++    """
++    Build DataLoaders from pre-built datasets.
++
++    All datasets are automatically wrapped with _IndexedDataset so that
++    provenance functions always receive 3-tuples (img, label, global_idx).
++
++    Args:
++        indexes_to_remove : list of *positional* indices within
++                            poisoned_train_dataset to exclude (retrain stage).
++                            Pass None or [] to keep all samples.
++    """
++    if indexes_to_remove is None:
++        indexes_to_remove = []
++
++    def _ensure_indexed(ds):
++        """Wrap to guarantee 3-tuple output."""
++        try:
++            sample = ds[0]
++        except Exception:
++            return _IndexedDataset(ds)
++        return ds if len(sample) >= 3 else _IndexedDataset(ds)
++
++    # ---- test loaders -------------------------------------------------------
++    # Test loaders are eval-only — no provenance indexing needed.
++    test_loader = DataLoader(
++        test_dataset,
++        batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True,
++    )
++
++    if isinstance(poisoned_test_dataset, dict):
++        poisoned_test_loader = {
++            name: DataLoader(
++                pds,
++                batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True,
++            )
++            for name, pds in poisoned_test_dataset.items()
++        }
+     else:
+-        poisoned_train_loader = DataLoader(poisoned_train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+-        if type(poisoned_train_dataset[0][2]) == torch.Tensor:
+-            target_class_indices = [idx.item() for img, lbl, idx in poisoned_train_dataset if lbl == target_class]
++        poisoned_test_loader = DataLoader(
++            poisoned_test_dataset,
++            batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True,
++        )
++
++    # ---- train loader -------------------------------------------------------
++    labels = _get_labels(poisoned_train_dataset)   # fast, no image loading
++
++    if len(indexes_to_remove) > 0:
++        print("Length of indexes to remove:", len(indexes_to_remove))
++        remove_set = set(int(i) for i in indexes_to_remove)
++
++        # For 3-tuple datasets the "global index" is element [2]; for 2-tuple
++        # datasets it is simply the positional index.
++        sample = poisoned_train_dataset[0]
++        if len(sample) >= 3:
++            s2 = sample[2]
++            global_indices = [
++                int(poisoned_train_dataset[i][2].item()
++                    if isinstance(poisoned_train_dataset[i][2], torch.Tensor)
++                    else poisoned_train_dataset[i][2])
++                for i in range(len(poisoned_train_dataset))
++            ]
+         else:
+-            target_class_indices = [idx for img, lbl, idx in poisoned_train_dataset if lbl == target_class]
+-    
+-    
+-    
++            global_indices = list(range(len(poisoned_train_dataset)))
++
++        print(len(set(global_indices) & remove_set), "poison samples overlap with removal set")
++        positions_to_keep = [
++            pos for pos, gidx in enumerate(global_indices) if gidx not in remove_set
++        ]
++        # FIX D5: wrap with _IndexedDataset BEFORE Subset so that the global
++        # positional index (not the subset position) is returned as element [2].
++        # If we wrap after Subset, element [2] is the subset position (0..N-removed)
++        # which doesn't match random_sus_idx (built from global positions).
++        indexed_base = _ensure_indexed(poisoned_train_dataset)
++        filtered_ds = Subset(indexed_base, positions_to_keep)
++        print("Length of filtered dataset:", len(filtered_ds))
++
++        # target_class_indices expressed as global indices for get_random_poison_idx
++        kept_labels = [labels[pos] for pos in positions_to_keep]
++        target_class_indices = [
++            global_indices[pos]
++            for pos, lbl in zip(positions_to_keep, kept_labels)
++            if lbl == target_class
++        ]
++
++        poisoned_train_loader = DataLoader(
++            filtered_ds,
++            batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True,
++        )
++
++    else:
++        poisoned_train_loader = DataLoader(
++            _ensure_indexed(poisoned_train_dataset),
++            batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True,
++        )
++
++        target_class_indices = [
++            i for i, lbl in enumerate(labels) if lbl == target_class
++        ]
++
+     return poisoned_train_loader, test_loader, poisoned_test_loader, target_class_indices
+-    
+ 
+ 
++# ---------------------------------------------------------------------------
++# Suspected-index sampler
++# ---------------------------------------------------------------------------
++
+ def get_random_poison_idx(
+     percentage, ignore_set, random_poison_idx,
+     target_class_all, poison_amount, seed,
+ ):
+     """
+-    Randomly pick additional *clean* indices from the target class so that the
+-    suspected set has   (#poison / percentage)  total size.
++    Randomly pick additional *clean* indices from the target class so that
++    the suspected set has   (#poison / percentage)  total size.
+     """
+     np.random.seed(seed)
+     random.seed(seed)
+     extra = int(poison_amount * (100 / percentage - 1))
+     clean_pool = list(set(target_class_all) - ignore_set)
+-    return random.sample(clean_pool, extra) + list(random_poison_idx)
++    return random.sample(clean_pool, min(extra, len(clean_pool))) + list(random_poison_idx)
++
++
++# ---------------------------------------------------------------------------
++# Caltech-256 Narcissus data-generation
++# ---------------------------------------------------------------------------
++
++def get_narcissus_caltech256_poisoned_data(
++    pr_tgt,
++    target_class,
++    dataset_dir,
++    model,
++    eps,
++    global_seed,
++    img_size=112,
++    surrogate_epochs=5,
++    gen_steps=200,
++    batch_size=64,
++    device=None,
++):
++    """
++    Generate a Narcissus clean-label backdoor dataset for Caltech-256.
++
++    Steps
++    -----
++    1. Load Caltech-256 via ImageFolder (same transform as main.py).
++    2. Replace the model's final Linear layer in-place for num_classes.
++    3. 80/20 train/test split (same generator seed as main.py).
++    4. Train a surrogate model on clean data for `surrogate_epochs` epochs.
++    5. Generate a universal trigger via PGD on target-class images.
++    6. Poison `pr_tgt` fraction of target-class training images.
++    7. Build a poisoned test set (all target-class test images carry the trigger).
++
++    Returns
++    -------
++    poisoned_train_dataset, test_dataset, poisoned_test_dataset, poison_indices
++        poison_indices : list of positional indices (0-based) within
++                         poisoned_train_dataset that are poisoned.
++    """
++    from torchvision.datasets import ImageFolder
++    from torchvision import transforms
++    from torch.utils.data import random_split
++
++    if device is None:
++        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++
++    # ── 1. Dataset ────────────────────────────────────────────────────────────
++    tfm = transforms.Compose([
++        transforms.Resize(img_size),
++        transforms.CenterCrop(img_size),
++        transforms.ToTensor(),
++        transforms.Normalize(mean=[0.485, 0.456, 0.406],
++                             std=[0.229, 0.224, 0.225]),
++    ])
++    full_ds    = ImageFolder(dataset_dir, transform=tfm)
++    num_classes = len(full_ds.classes)
++    all_labels  = full_ds.targets          # list[int], length = len(full_ds)
++    print(f"Caltech-256: {len(full_ds)} images, {num_classes} classes")
++
++    # ── 2. Replace model head ─────────────────────────────────────────────────
++    if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
++        model.fc = nn.Linear(model.fc.in_features, num_classes)
++        print(f"Replaced fc -> out_features={num_classes}")
++    else:
++        _last_name, _last_mod = None, None
++        for _nm, _md in model.named_modules():
++            if isinstance(_md, nn.Linear):
++                _last_name, _last_mod = _nm, _md
++        if _last_mod is None:
++            raise ValueError("No nn.Linear found in model")
++        _par = model
++        for _pt in _last_name.split('.')[:-1]:
++            _par = getattr(_par, _pt)
++        setattr(_par, _last_name.split('.')[-1],
++                nn.Linear(_last_mod.in_features, num_classes))
++        print(f"Replaced {_last_name} -> out_features={num_classes}")
++
++    # ── 3. Train / test split ─────────────────────────────────────────────────
++    g       = torch.Generator().manual_seed(global_seed)
++    n       = len(full_ds)
++    n_train = int(0.8 * n)
++    n_test  = n - n_train
++    train_subset, test_subset = random_split(full_ds, [n_train, n_test], generator=g)
++
++    # Positional indices within train_subset that belong to target_class
++    train_target_pos = [
++        pos for pos, fi in enumerate(train_subset.indices)
++        if all_labels[fi] == target_class
++    ]
++    test_target_pos = [
++        pos for pos, fi in enumerate(test_subset.indices)
++        if all_labels[fi] == target_class
++    ]
++    print(f"Target class {target_class}: "
++          f"{len(train_target_pos)} train, {len(test_target_pos)} test images")
++
++    # ── 4. Surrogate training ─────────────────────────────────────────────────
++    surrogate = copy.deepcopy(model).to(device)
++    sur_opt   = torch.optim.SGD(
++        surrogate.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4,
++    )
++    sur_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
++        sur_opt, T_max=surrogate_epochs,
++    )
++    criterion = nn.CrossEntropyLoss()
++
++    clean_loader = DataLoader(
++        train_subset, batch_size=batch_size, shuffle=True,
++        num_workers=0, pin_memory=True,
++    )
++    print(f"Training surrogate for {surrogate_epochs} epochs "
++          f"({n_train} samples, bs={batch_size}) …")
++    surrogate.train()
++    for ep in range(surrogate_epochs):
++        for x, y in clean_loader:
++            x, y = x.to(device), y.to(device)
++            sur_opt.zero_grad()
++            criterion(surrogate(x), y).backward()
++            sur_opt.step()
++        sur_sched.step()
++        print(f"  Surrogate epoch {ep + 1}/{surrogate_epochs}")
++    surrogate.eval()
++    # Free training state — optimizer, scheduler, criterion, and loader all hold
++    # GPU tensors / references that would otherwise survive into PGD generation.
++    del sur_opt, sur_sched, criterion, clean_loader
++    # Freeze surrogate weights so autograd only tracks trigger → loss, not the
++    # 11M surrogate parameters.  Cuts per-batch activation memory ~30 %.
++    for p in surrogate.parameters():
++        p.requires_grad_(False)
++    torch.cuda.empty_cache()
++
++    # ── 5. Trigger generation (PGD) ───────────────────────────────────────────
++    eps_float = eps / 255.0      # L-inf bound in normalised image space
++
++    # DataLoader over target-class training images only
++    target_train_sub = Subset(train_subset, train_target_pos)
++    tgt_loader = DataLoader(
++        target_train_sub,
++        batch_size=min(batch_size, len(target_train_sub)),
++        shuffle=True, num_workers=0,
++    )
++
++    torch.manual_seed(global_seed)
++    trigger = torch.zeros(1, 3, img_size, img_size, device=device)
++    lr_pgd  = eps_float / 10.0
++
++    print(f"Generating Narcissus trigger "
++          f"({gen_steps} PGD steps, eps={eps}/255) …")
++    for step in range(gen_steps):
++        if step % 10 == 0 or step == gen_steps - 1:
++            print(f"  PGD step {step + 1}/{gen_steps}", flush=True)
++        trigger.requires_grad_(True)
++        # Per-batch backward: releases each batch's computation graph immediately
++        # instead of holding all 40 batches in VRAM simultaneously.
++        for x, y in tgt_loader:
++            x   = x.to(device)
++            x_p = torch.clamp(x + trigger, -3.0, 3.0)
++            logits = surrogate(x_p)
++            tgt = torch.full((x.size(0),), target_class,
++                             dtype=torch.long, device=device)
++            loss = -F.cross_entropy(logits, tgt)
++            loss.backward()          # grad accumulates into trigger.grad
++            del x, x_p, logits, tgt, loss
++        with torch.no_grad():
++            trigger = trigger - lr_pgd * trigger.grad.sign()
++            trigger = torch.clamp(trigger, -eps_float, eps_float)
++        trigger = trigger.detach()
++
++    trigger_cpu = trigger.squeeze(0).cpu()   # [C, H, W]
++    print(f"Trigger L-inf: {trigger_cpu.abs().max().item():.4f}")
++
++    # ── 6. Select samples to poison ───────────────────────────────────────────
++    n_poison   = max(1, int(len(train_target_pos) * pr_tgt / 100))  # FIX D4: pr_tgt is a percentage
++    rng        = np.random.default_rng(global_seed)
++    poison_pos = list(rng.choice(train_target_pos, n_poison, replace=False).tolist())
++    print(f"Poisoning {n_poison}/{len(train_target_pos)} target-class train samples")
++
++    # ── 7. Build poisoned datasets ────────────────────────────────────────────
++    poisoned_train_ds = _PoisonedDataset(
++        train_subset, poison_pos, trigger_cpu,
++        clamp_min=-3.0, clamp_max=3.0,
++    )
++    # Poisoned test: every target-class test image carries the trigger
++    poisoned_test_ds = _PoisonedDataset(
++        test_subset, test_target_pos, trigger_cpu,
++        clamp_min=-3.0, clamp_max=3.0,
++    )
++
++    poison_indices = poison_pos   # positional indices into poisoned_train_ds
++
++    return poisoned_train_ds, test_subset, poisoned_test_ds, poison_indices
++
++
++# ---------------------------------------------------------------------------
++# Emotion-Recognition Narcissus data-generation
++# ---------------------------------------------------------------------------
++
++def _find_emotion_root(base):
++    """
++    Walk *base* and return the first directory whose immediate children are
++    image class folders (each subdir directly contains image files).
++
++    Handles both flat layouts  (base/angry/, base/happy/, …)  and split
++    layouts  (base/train/angry/, base/train/happy/, …).  The walk always
++    returns the class-folder parent, never the class folders themselves.
++    """
++    import os as _os
++    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
++    for root, dirs, _ in _os.walk(base):
++        dirs.sort()
++        if len(dirs) < 2:
++            continue
++        # Peek inside the first subdir to see whether it holds images
++        sample_sub = _os.path.join(root, dirs[0])
++        try:
++            contents = _os.listdir(sample_sub)
++        except PermissionError:
++            continue
++        has_images = any(
++            _os.path.splitext(f)[1].lower() in IMG_EXTS for f in contents
++        )
++        if has_images:
++            return root          # this is the class-folder level
++    return base                  # fall back to supplied root
++
++
++def get_narcissus_emotion_poisoned_data(
++    pr_tgt,
++    target_class,
++    dataset_dir,
++    model,
++    eps,
++    global_seed,
++    img_size=112,
++    surrogate_epochs=5,
++    gen_steps=200,
++    batch_size=64,
++    device=None,
++):
++    """
++    Generate a Narcissus clean-label backdoor dataset for Facial Emotion
++    Recognition.
++
++    Lessons applied from Caltech-256 development
++    ---------------------------------------------
++    D4  pr_tgt is a percentage  → divide by 100 before multiplying
++    D5  _IndexedDataset wraps BEFORE Subset  → global indices preserved
++    P1  Crop size derived from actual image height (not hardcoded 32)
++    P2  Test-sample offset = len(dataset), not hardcoded 50000
++    W2  num_workers=0 everywhere (Windows / Kaggle multi-process safety)
++    W3  Test loaders NOT wrapped with _IndexedDataset
++    Grayscale images are automatically promoted to 3-channel RGB.
++
++    Parameters
++    ----------
++    dataset_dir  : root returned by _find_emotion_root(); may be the class
++                   parent of a split (train/) or a flat class directory
++    pr_tgt       : percentage of target-class train samples to poison (e.g. 10)
++    target_class : integer class index for the backdoor target
++    eps          : L-inf trigger budget in [0, 255] pixel units
++    global_seed  : reproducibility seed
++
++    Returns
++    -------
++    poisoned_train_dataset, test_dataset, poisoned_test_dataset, poison_indices
++        poison_indices : positional indices (0-based) within poisoned_train_dataset
++    """
++    from torchvision.datasets import ImageFolder
++    from torchvision import transforms
++    from torch.utils.data import random_split
++    import os
++
++    if device is None:
++        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++    # Auto-find the class-folder level (handles train/test splits)
++    class_root = _find_emotion_root(dataset_dir)
++    print(f"Emotion dataset root resolved to: {class_root}")
++
++    # ── 1. Dataset ────────────────────────────────────────────────────────────
++    # Grayscale(3) is a no-op for RGB images; it upcycles 1-channel images
++    # (common in FER-2013 derived datasets) to 3-channel so ResNet18 works.
++    tfm = transforms.Compose([
++        transforms.Grayscale(num_output_channels=3),
++        transforms.Resize(img_size),
++        transforms.CenterCrop(img_size),
++        transforms.ToTensor(),
++        transforms.Normalize(mean=[0.485, 0.456, 0.406],
++                             std=[0.229, 0.224, 0.225]),
++    ])
++    full_ds     = ImageFolder(class_root, transform=tfm)
++    num_classes = len(full_ds.classes)
++    all_labels  = full_ds.targets
++    print(f"Emotion dataset: {len(full_ds)} images, {num_classes} classes")
++    print(f"  Classes: {full_ds.classes}")
++
++    # ── 2. Replace model head ─────────────────────────────────────────────────
++    if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
++        model.fc = nn.Linear(model.fc.in_features, num_classes)
++        print(f"Replaced fc -> out_features={num_classes}")
++    else:
++        _last_name, _last_mod = None, None
++        for _nm, _md in model.named_modules():
++            if isinstance(_md, nn.Linear):
++                _last_name, _last_mod = _nm, _md
++        if _last_mod is None:
++            raise ValueError("No nn.Linear found in model")
++        _par = model
++        for _pt in _last_name.split(".")[:-1]:
++            _par = getattr(_par, _pt)
++        setattr(_par, _last_name.split(".")[-1],
++                nn.Linear(_last_mod.in_features, num_classes))
++        print(f"Replaced {_last_name} -> out_features={num_classes}")
++
++    # ── 3. Train / test split ─────────────────────────────────────────────────
++    g       = torch.Generator().manual_seed(global_seed)
++    n       = len(full_ds)
++    n_train = int(0.8 * n)
++    n_test  = n - n_train
++    train_subset, test_subset = random_split(full_ds, [n_train, n_test],
++                                             generator=g)
++
++    train_target_pos = [
++        pos for pos, fi in enumerate(train_subset.indices)
++        if all_labels[fi] == target_class
++    ]
++    test_target_pos = [
++        pos for pos, fi in enumerate(test_subset.indices)
++        if all_labels[fi] == target_class
++    ]
++    print(f"Target class {target_class} ({full_ds.classes[target_class]}): "
++          f"{len(train_target_pos)} train, {len(test_target_pos)} test images")
++
++    if len(train_target_pos) == 0:
++        raise ValueError(
++            f"No training images found for target_class={target_class}. "
++            f"Classes available: {full_ds.classes}"
++        )
++
++    # ── 4. Surrogate training ─────────────────────────────────────────────────
++    surrogate = copy.deepcopy(model).to(device)
++    sur_opt   = torch.optim.SGD(
++        surrogate.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4,
++    )
++    sur_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
++        sur_opt, T_max=surrogate_epochs,
++    )
++    criterion = nn.CrossEntropyLoss()
++
++    clean_loader = DataLoader(
++        train_subset, batch_size=batch_size, shuffle=True,
++        num_workers=0, pin_memory=True,
++    )
++    print(f"Training surrogate for {surrogate_epochs} epochs "
++          f"({n_train} samples, bs={batch_size}) …")
++    surrogate.train()
++    for ep in range(surrogate_epochs):
++        for x, y in clean_loader:
++            x, y = x.to(device), y.to(device)
++            sur_opt.zero_grad()
++            criterion(surrogate(x), y).backward()
++            sur_opt.step()
++        sur_sched.step()
++        print(f"  Surrogate epoch {ep + 1}/{surrogate_epochs}")
++    surrogate.eval()
++    del sur_opt, sur_sched, criterion, clean_loader
++    for p in surrogate.parameters():
++        p.requires_grad_(False)
++    torch.cuda.empty_cache()
++
++    # ── 5. Trigger generation (PGD) ───────────────────────────────────────────
++    eps_float = eps / 255.0
++
++    target_train_sub = Subset(train_subset, train_target_pos)
++    tgt_loader = DataLoader(
++        target_train_sub,
++        batch_size=min(batch_size, len(target_train_sub)),
++        shuffle=True, num_workers=0,
++    )
++
++    torch.manual_seed(global_seed)
++    trigger = torch.zeros(1, 3, img_size, img_size, device=device)
++    lr_pgd  = eps_float / 10.0
++
++    print(f"Generating Narcissus trigger "
++          f"({gen_steps} PGD steps, eps={eps}/255) …")
++    for step in range(gen_steps):
++        if step % 10 == 0 or step == gen_steps - 1:
++            print(f"  PGD step {step + 1}/{gen_steps}", flush=True)
++        trigger.requires_grad_(True)
++        for x, y in tgt_loader:
++            x   = x.to(device)
++            x_p = torch.clamp(x + trigger, -3.0, 3.0)
++            logits = surrogate(x_p)
++            tgt = torch.full((x.size(0),), target_class,
++                             dtype=torch.long, device=device)
++            loss = -F.cross_entropy(logits, tgt)
++            loss.backward()
++            del x, x_p, logits, tgt, loss
++        with torch.no_grad():
++            trigger = trigger - lr_pgd * trigger.grad.sign()
++            trigger = torch.clamp(trigger, -eps_float, eps_float)
++        trigger = trigger.detach()
++
++    trigger_cpu = trigger.squeeze(0).cpu()
++    print(f"Trigger L-inf: {trigger_cpu.abs().max().item():.4f}")
++
++    # ── 6. Select samples to poison ───────────────────────────────────────────
++    n_poison   = max(1, int(len(train_target_pos) * pr_tgt / 100))  # FIX D4
++    rng        = np.random.default_rng(global_seed)
++    poison_pos = list(rng.choice(train_target_pos, n_poison, replace=False).tolist())
++    print(f"Poisoning {n_poison}/{len(train_target_pos)} target-class train samples")
++
++    # ── 7. Build poisoned datasets ────────────────────────────────────────────
++    poisoned_train_ds = _PoisonedDataset(
++        train_subset, poison_pos, trigger_cpu,
++        clamp_min=-3.0, clamp_max=3.0,
++    )
++    poisoned_test_ds = _PoisonedDataset(
++        test_subset, test_target_pos, trigger_cpu,
++        clamp_min=-3.0, clamp_max=3.0,
++    )
+ 
+-    
+\ No newline at end of file
++    return poisoned_train_ds, test_subset, poisoned_test_ds, poison_pos
+diff --git a/src/helpers/provenance.py b/src/helpers/provenance.py
+index d5bb28530..03846f44a 100644
+--- a/src/helpers/provenance.py
++++ b/src/helpers/provenance.py
+@@ -89,25 +89,31 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+     if not sample_from_test:
+         target_images = [dataset[i][0] for i in range(len(dataset)) if dataset[i][1] == target_class]
+         target_images = torch.stack(target_images).to(device)
+-        target_indices = [dataset[i][2] for i in range(len(dataset)) if dataset[i][1] == target_class and dataset[i][2] not in random_sus_idx]
++        if len(dataset[0]) >= 3:
++            target_indices = [dataset[i][2] for i in range(len(dataset)) if dataset[i][1] == target_class and dataset[i][2] not in random_sus_idx]
++        else:
++            target_indices = [i for i in range(len(dataset)) if dataset[i][1] == target_class and i not in random_sus_idx]
+     else:
++        # P1 fix: derive crop size from the actual images, not hardcoded for CIFAR-10
++        _img_h = dataset[0][0].shape[-2] if len(dataset[0][0].shape) >= 2 else 32
++        _pad   = max(4, _img_h // 8)
+         transform_train = Compose([
+-            RandomCrop(32, padding=4),
++            RandomCrop(_img_h, padding=_pad),
+             RandomHorizontalFlip(),
+         ])
+-        
++
+         transform_sa = Compose([
+             RandomHorizontalFlip(),
+         ])
+-        
++
+         test_dataset = test_loader.dataset
+         target_images = [test_dataset[i][0].clone() for i in range(len(test_dataset)) if test_dataset[i][1] == target_class]
+-        
++
+         if attack == 'narcissus' or attack == 'lc':
+             target_images = [transform_train(img) for img in target_images]
+         elif attack == 'sa':
+             target_images = [transform_sa(img) for img in target_images]
+-               
++
+         print(len(target_images))
+         target_images = torch.stack(target_images).to(device)
+         print("target images shape:", target_images.shape, "attack: ", attack)
+@@ -162,8 +168,13 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+         
+ 
+         
+-        for images, labels, indices in pbar:
+-            images, labels, indices = images.to(device).float(), labels.to(device).long(), indices                       
++        for batch in pbar:
++            if len(batch) >= 3:
++                images, labels, indices = batch[0], batch[1], batch[2]
++            else:
++                images, labels = batch[0], batch[1]
++                indices = list(range(len(images)))
++            images, labels = images.to(device).float(), labels.to(device).long()
+             
+             start_time = time.time()
+             
+@@ -191,6 +202,8 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+             
+             images = images.clone()
+             labels = labels.clone()
++            if isinstance(indices, list):
++                indices = torch.tensor(indices)
+             indices = indices.clone()
+     
+ 
+@@ -208,26 +221,29 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+                     if len(available_indices) < len(pos_indices):
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices = random.sample(remaining_target_indices, len(pos_indices) - len(available_indices))
+-                        clean_indices = available_indices 
++                        n_extra = min(len(pos_indices) - len(available_indices), len(remaining_target_indices))
++                        extra_clean_indices = random.sample(remaining_target_indices, n_extra)
++                        clean_indices = available_indices
+                     else:
+                         extra_clean_indices = []
+-                        clean_indices = random.sample(available_indices, len(pos_indices)) 
++                        clean_indices = random.sample(available_indices, min(len(pos_indices), len(available_indices)))
+                     available_indices = list(set(target_indices_batch) - set(pos_indices) - set(clean_indices))
+                     if len(available_indices) < len(pos_indices) and len(available_indices) != 0:
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices_2 = random.sample(remaining_target_indices, len(pos_indices) - len(available_indices))
++                        n_extra_2 = min(len(pos_indices) - len(available_indices), len(remaining_target_indices))
++                        extra_clean_indices_2 = random.sample(remaining_target_indices, n_extra_2)
+                         clean_indices_2 = available_indices
+                     elif len(available_indices) == 0:
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices_2 = random.sample(remaining_target_indices, len(pos_indices))
++                        n_extra_2 = min(len(pos_indices), len(remaining_target_indices))
++                        extra_clean_indices_2 = random.sample(remaining_target_indices, n_extra_2)
+                         clean_indices_2 = []
+                     else:
+                         extra_clean_indices_2 = []
+-                        clean_indices_2 = random.sample(available_indices, len(pos_indices))
+-                    
++                        clean_indices_2 = random.sample(available_indices, min(len(pos_indices), len(available_indices)))
++
+                     remaining_indices = list(set(range(len(indices))) - set(pos_indices) - set(clean_indices) - set(clean_indices_2))
+                     assert set(indices[remaining_indices]) & set(random_sus_idx) == set() and  set(indices[clean_indices]) & set(random_sus_idx) == set() and  set(indices[clean_indices_2]) & set(random_sus_idx) == set()
+ 
+@@ -310,16 +326,19 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+ 
+ 
+ 
+-                sur_model.train(mode = training_mode)  
++                if clean_batch.shape[0] == 0:
++                    continue
++
++                sur_model.train(mode = training_mode)
+                 output = sur_model(clean_batch)
+-            
+-                    
+-                    
++
++
++
+                 clean_labels = clean_labels.long()
+                 loss = criterion(output, clean_labels)
+                 loss.backward()
+                 sur_optimizer.step()
+-                
++
+                 sur_model_state_dict = sur_model.state_dict()
+                 temp_clean = torch.cat([
+                     (sur_model_state_dict[key] - original_weights[key]).view(-1)
+@@ -354,15 +373,18 @@ def capture_first_level_multi_epoch_batch_sample_weight_updates(
+                 step5_1_time = time.time() - start_time_2
+                 step5_1_time_avg += step5_1_time
+                 
+-                sur_model.train(mode = training_mode)    
++                if clean_batch.shape[0] == 0:
++                    continue
++
++                sur_model.train(mode = training_mode)
+                 output = sur_model(clean_batch)
+-                
+-                    
++
++
+                 clean_labels = clean_labels.long()
+                 loss = criterion(output, clean_labels)
+                 loss.backward()
+                 sur_optimizer.step()
+-                
++
+                 sur_model_state_dict = sur_model.state_dict()
+                 temp_clean_2 = torch.cat([
+                         (sur_model_state_dict[key] - original_weights[key]).view(-1)
+@@ -550,17 +572,23 @@ def capture_sample_level_weight_updates_idv(
+     if not sample_from_test:
+         target_images = [dataset[i][0] for i in range(len(dataset)) if dataset[i][1] == target_class]
+         target_images = torch.stack(target_images).to(device)
+-        target_indices = [dataset[i][2] for i in range(len(dataset)) if dataset[i][1] == target_class and dataset[i][2] not in random_sus_idx]
++        if len(dataset[0]) >= 3:
++            target_indices = [dataset[i][2] for i in range(len(dataset)) if dataset[i][1] == target_class and dataset[i][2] not in random_sus_idx]
++        else:
++            target_indices = [i for i in range(len(dataset)) if dataset[i][1] == target_class and i not in random_sus_idx]
+     else:
++        # P1 fix: derive crop size from the actual images, not hardcoded for CIFAR-10
++        _img_h = dataset[0][0].shape[-2] if len(dataset[0][0].shape) >= 2 else 32
++        _pad   = max(4, _img_h // 8)
+         transform_train = Compose([
+-            RandomCrop(32, padding=4),
++            RandomCrop(_img_h, padding=_pad),
+             RandomHorizontalFlip(),
+         ])
+-        
++
+         transform_sa = Compose([
+             RandomHorizontalFlip(),
+         ])
+-        
++
+         test_dataset = test_loader.dataset
+         target_images = [test_dataset[i][0].clone() for i in range(len(test_dataset)) if test_dataset[i][1] == target_class]
+         if attack == 'narcissus' or attack == 'lc':
+@@ -615,8 +643,13 @@ def capture_sample_level_weight_updates_idv(
+         step7_time_avg = 0
+     
+         
+-        for images, labels, indices in pbar:
+-            images, labels, indices = images.to(device).float(), labels.to(device).long(), indices                      
++        for batch in pbar:
++            if len(batch) >= 3:
++                images, labels, indices = batch[0], batch[1], batch[2]
++            else:
++                images, labels = batch[0], batch[1]
++                indices = list(range(len(images)))
++            images, labels = images.to(device).float(), labels.to(device).long()
+             
+             start_time = time.time()
+             
+@@ -647,8 +680,12 @@ def capture_sample_level_weight_updates_idv(
+             temp_clean = {}
+             
+             
++            if isinstance(indices, list):
++                indices = torch.tensor(indices)
+             indices = indices.clone()
+             labels  = labels.clone()
++            if isinstance(indices, list):
++                indices = torch.tensor(indices)
+             indices = indices.clone()
+             
+ 
+@@ -665,26 +702,28 @@ def capture_sample_level_weight_updates_idv(
+                     if len(available_indices) < len(pos_indices):
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices = random.sample(remaining_target_indices, len(pos_indices) - len(available_indices))
+-                        clean_indices = available_indices 
++                        n_extra = min(len(pos_indices) - len(available_indices), len(remaining_target_indices))
++                        extra_clean_indices = random.sample(remaining_target_indices, n_extra)
++                        clean_indices = available_indices
+                     else:
+                         extra_clean_indices = []
+-                        clean_indices = random.sample(available_indices, len(pos_indices)) 
++                        clean_indices = random.sample(available_indices, min(len(pos_indices), len(available_indices)))
+                     available_indices = list(set(target_indices_batch) - set(pos_indices) - set(clean_indices))
+                     if len(available_indices) < len(pos_indices) and len(available_indices) != 0:
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices_2 = random.sample(remaining_target_indices, len(pos_indices) - len(available_indices))
++                        n_extra_2 = min(len(pos_indices) - len(available_indices), len(remaining_target_indices))
++                        extra_clean_indices_2 = random.sample(remaining_target_indices, n_extra_2)
+                         clean_indices_2 = available_indices
+                     elif len(available_indices) == 0:
+                         indices_to_ignore = set(random_sus_idx) | set(indices[available_indices].cpu().numpy())
+                         remaining_target_indices = [i for i, idx in enumerate(target_indices) if idx not in indices_to_ignore]
+-                        extra_clean_indices_2 = random.sample(remaining_target_indices, len(pos_indices))
++                        n_extra_2 = min(len(pos_indices), len(remaining_target_indices))
++                        extra_clean_indices_2 = random.sample(remaining_target_indices, n_extra_2)
+                         clean_indices_2 = []
+                     else:
+                         extra_clean_indices_2 = []
+-                        clean_indices_2 = random.sample(available_indices, len(pos_indices))
+-                    
++                        clean_indices_2 = random.sample(available_indices, min(len(pos_indices), len(available_indices)))
+ 
+                     assert set(indices[pos_indices].cpu().numpy()) & set(random_sus_idx) == set(indices[pos_indices].cpu().numpy())
+                     assert np.all(labels[clean_indices].cpu().numpy() == target_class)
+@@ -727,7 +766,7 @@ def capture_sample_level_weight_updates_idv(
+                 else:
+                     clean_batch = target_images[clean_indices]
+                     clean_labels = torch.tensor([target_class] * len(clean_indices)).to(device)
+-                    clean_indexes = np.array(clean_indices) + 50000
++                    clean_indexes = np.array(clean_indices) + len(dataset)  # P2 fix: was +50000 (CIFAR-10 specific)
+                 
+                 step_4_1_time = time.time() - start_time
+                 step_4_1_time_avg += step_4_1_time
+@@ -750,7 +789,7 @@ def capture_sample_level_weight_updates_idv(
+                 else:
+                     clean_batch_2 = target_images[clean_indices_2]
+                     clean_labels_2 = torch.tensor([target_class] * len(clean_indices_2)).to(device)
+-                    clean_indexes_2 = np.array(clean_indices_2) + 50000
++                    clean_indexes_2 = np.array(clean_indices_2) + len(dataset)  # P2 fix: was +50000 (CIFAR-10 specific)
+                 
+                 
+                 tagged_clean_indexes = [(index, 1) for index in clean_indexes] 
+@@ -788,7 +827,7 @@ def capture_sample_level_weight_updates_idv(
+                 
+                 for image, label, (index, tag) in combined_loader:
+                     torch_rng_state = torch.get_rng_state()
+-                    cuda_rng_state = torch.cuda.get_rng_state()
++                    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                     np_rng_state = np.random.get_state()
+                     python_rng_state = random.getstate()
+     
+diff --git a/src/helpers/scoring.py b/src/helpers/scoring.py
+index 2bacc4166..7625c7708 100644
+--- a/src/helpers/scoring.py
++++ b/src/helpers/scoring.py
+@@ -70,6 +70,13 @@ def train_prov_data_custom(
+     y_sus = np.ones(len(X_sus))
+     y_clean = np.zeros(len(X_clean))
+ 
++    # Guard: ensure both arrays are 2D before concatenation (can be 1D when empty on tiny datasets)
++    n_features = X_sus.shape[1] if X_sus.ndim == 2 else (X_clean.shape[1] if X_clean.ndim == 2 else 0)
++    if X_clean.ndim == 1:
++        X_clean = X_clean.reshape(0, n_features)
++    if X_sus.ndim == 1:
++        X_sus = X_sus.reshape(0, n_features)
++
+     X = np.concatenate([X_clean, X_sus])
+     del X_sus, X_clean
+     y = np.concatenate([y_clean, y_sus])
+@@ -88,13 +95,19 @@ def train_prov_data_custom(
+         np.random.seed(seed)
+         shuffled_indices = np.random.permutation(image_indices)
+         return np.array_split(shuffled_indices, n_splits)
+-    
+-    
+-    
++
++
+ 
+     unique_sus_images = np.unique(sus_igs_inds)
+     unique_clean_images = np.unique(clean_igs_inds)
+ 
++    # Guard: if either set is empty (e.g. smoke data with zero features), scoring is meaningless
++    if len(unique_sus_images) == 0 or len(unique_clean_images) == 0:
++        return None, np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
++
++    # Clamp n_groups so every fold has at least one training image in both sets
++    n_groups = max(1, min(n_groups, len(unique_sus_images), len(unique_clean_images)))
++
+     sus_image_groups = split_images_into_groups(unique_sus_images, n_groups)
+     clean_image_groups = split_images_into_groups(unique_clean_images, n_groups)
+ 
+@@ -109,26 +122,33 @@ def train_prov_data_custom(
+     # Define models
+     models = {
+         'prf': prf(n_estimators=100, bootstrap=True, n_jobs=-1),
+-        'RandomForest': RandomForestClassifier(random_state=seed, n_jobs=-1, n_estimators=100, class_weight='balanced'), 
++        'RandomForest': RandomForestClassifier(random_state=seed, n_jobs=-1, n_estimators=100, class_weight='balanced'),
+         'LogisticRegression': LogisticRegression(max_iter=1000, random_state=seed),
+         'LinearSVM': SVC(kernel='linear', probability=True, random_state=seed),
+         'KernelSVM': SVC(kernel='rbf', probability=True, random_state=seed)
+     }
+-    
+-    
++
++
+     param_grid = {
+         'n_estimators': [100,  300, 500],
+-        'max_depth': [None, 10, 5],  
++        'max_depth': [None, 10, 5],
+     }
+ 
+     # Iterate through each group to perform cross-validation
+     for i in range(n_groups):
+         test_sus_indices = np.concatenate([np.where(concated_igs == img_idx)[0] for img_idx in sus_image_groups[i]])
+-        train_sus_indices = np.concatenate([np.where(concated_igs  == img_idx)[0] for j, group in enumerate(sus_image_groups) if j != i for img_idx in group])
+-        
++        _sus_train_list = [np.where(concated_igs == img_idx)[0] for j, group in enumerate(sus_image_groups) if j != i for img_idx in group]
++        # FIX S2: when n_groups=1 the train list is empty; fall back to using all data for both train and test
++        if not _sus_train_list:
++            _sus_train_list = [np.where(concated_igs == img_idx)[0] for group in sus_image_groups for img_idx in group]
++        train_sus_indices = np.concatenate(_sus_train_list)
++
+         test_clean_indices = np.concatenate([np.where(concated_igs == img_idx)[0] for img_idx in clean_image_groups[i]])
+-        train_clean_indices = np.concatenate([np.where(concated_igs == img_idx)[0] for j, group in enumerate(clean_image_groups) if j != i for img_idx in group]) 
+-        
++        _clean_train_list = [np.where(concated_igs == img_idx)[0] for j, group in enumerate(clean_image_groups) if j != i for img_idx in group]
++        if not _clean_train_list:
++            _clean_train_list = [np.where(concated_igs == img_idx)[0] for group in clean_image_groups for img_idx in group]
++        train_clean_indices = np.concatenate(_clean_train_list)
++
+         # Create training and testing sets
+         train_indices = np.concatenate([train_clean_indices, train_sus_indices])
+         test_indices = np.concatenate([test_clean_indices, test_sus_indices])
+@@ -136,9 +156,9 @@ def train_prov_data_custom(
+         y_train, y_test = y[train_indices], y[test_indices]
+ 
+         # Train and evaluate the selected model
+-        X_labeled = np.empty((0, X_train.shape[1]))  
++        X_labeled = np.empty((0, X_train.shape[1]))
+         y_labeled = np.empty((0,))
+-        
++
+ 
+         pos_inds_train = [i for i, ind in enumerate(concated_igs[train_indices[y_train==1]]) if ind in random_poison_idx]
+         pos_inds = np.array([ind for ind in concated_igs[train_indices[y_train==1]]])
+@@ -148,15 +168,15 @@ def train_prov_data_custom(
+         m = 3
+ 
+         if model_name in models:
+-            if model_name == "RandomForest":  
++            if model_name == "RandomForest":
+                 clf = models[model_name]
+                 iteration = 0
+                 X_sus_temp = X_train[y_train == 1].copy()
+                 X_clean_temp = X_train[y_train == 0].copy()
+ 
+-                
++
+                 # if i == 0:
+-                #     grid_search = GridSearchCV(estimator=models[model_name], param_grid=param_grid, 
++                #     grid_search = GridSearchCV(estimator=models[model_name], param_grid=param_grid,
+                 #                     scoring='f1_weighted', cv=3)
+                 #     grid_search.fit(X_train, y_train)
+                 #     clf = grid_search.best_estimator_
+@@ -165,16 +185,16 @@ def train_prov_data_custom(
+                 best_params = {'max_depth':10, 'n_estimators': 200}
+                 clf = RandomForestClassifier(**best_params, n_jobs=-1, random_state=seed)
+                 # clf = RandomForestClassifier(**grid_search.best_params_, n_jobs=-1, random_state=seed)
+-                clf.fit(X_train, y_train) 
+-                
++                clf.fit(X_train, y_train)
++
+                 while iteration < max_iters:
+                     iteration += 1
+-                    
++
+                     if iteration > 1:
+                         confidence_threshold = 0.7
+ 
+                     y_proba = clf.predict_proba(X_sus_temp)[:, 1]
+-                    
++
+                     high_conf_indices = np.where(y_proba > confidence_threshold)[0]
+ 
+                     true_pos = set(pos_inds_train) & set(high_conf_indices)
+@@ -185,24 +205,24 @@ def train_prov_data_custom(
+                     if len(high_conf_indices) == 0:
+                         break
+ 
+-                    X_labeled = np.concatenate([X_labeled, X_sus_temp[high_conf_indices]])                                                                                                      
++                    X_labeled = np.concatenate([X_labeled, X_sus_temp[high_conf_indices]])
+                     y_labeled = np.concatenate([y_labeled, np.ones(len(high_conf_indices))])
+ 
+                     X_train_temp = np.concatenate([X_labeled, X_clean_temp[:len(X_labeled)*m]])
+-                    y_train_temp = np.concatenate([y_labeled, (len(X_train_temp) - len(X_labeled)) * [0]])                 
++                    y_train_temp = np.concatenate([y_labeled, (len(X_train_temp) - len(X_labeled)) * [0]])
+ 
+-                    X_sus_temp = np.delete(X_sus_temp, high_conf_indices, axis=0)  
++                    X_sus_temp = np.delete(X_sus_temp, high_conf_indices, axis=0)
+                     if len(X_sus_temp) == 0:
+                         break
+                     remaining_indices = set(range(len(X_sus_temp))) - set(high_conf_indices)
+                     pos_inds_train = [i for i, ind in enumerate(remaining_indices) if pos_inds[ind] in random_poison_idx]
+                     pos_inds  = np.delete(pos_inds, high_conf_indices , axis=0)
+-                    clf.fit(X_train_temp, y_train_temp)     
++                    clf.fit(X_train_temp, y_train_temp)
++
+ 
+- 
+             else:
+                 if i == 0:
+-                    grid_search = GridSearchCV(estimator=models[model_name], param_grid=param_grid, 
++                    grid_search = GridSearchCV(estimator=models[model_name], param_grid=param_grid,
+                                     scoring='f1_weighted', cv=2)
+                     grid_search.fit(X_train, y_train)
+                     clf = grid_search.best_estimator_
+@@ -226,7 +246,7 @@ def train_prov_data_custom(
+             model = DNN(input_shape, 2)
+             model.to(device)
+             criterion = nn.CrossEntropyLoss()
+-            optimizer = optim.Adam(model.parameters(), lr=0.0001)    
++            optimizer = optim.Adam(model.parameters(), lr=0.0001)
+ 
+             X_train = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
+             X_test = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long))
+@@ -259,7 +279,7 @@ def train_prov_data_custom(
+                     _, preds = torch.max(outputs, 1)
+                     y_pred.extend(preds.cpu().numpy())
+                     y_pred_proba.extend(torch.softmax(outputs, dim=1)[:, 1].cpu().numpy())
+-            
++
+             # Calculate feature importance using integrated gradients
+             ig = IntegratedGradients(model)
+             input_tensor = torch.tensor(X[train_indices][:128], dtype=torch.float32, requires_grad=True).to(device)
+@@ -280,7 +300,7 @@ def train_prov_data_custom(
+         y_test = np.array(y_test)
+         y_pred = np.array(y_pred)
+         pos_recall = recall_score(y_test[pos_inds], y_pred[pos_inds])
+-        
++
+         if verbose:
+             sus_clean_inds = [i for i, ind in enumerate(concated_igs[test_indices]) if ind in random_clean_sus_idx]
+             if len(sus_clean_inds) > 0:
+@@ -288,29 +308,29 @@ def train_prov_data_custom(
+                 print(f"Model: {model_name} - Group {i+1} Test Acc: {ACC:.4f} TPR: {TPR:.4f} Poison TPR: {pos_recall:.4f} Suspected Clean TPR: {sus_clean_acc:.4f}")
+             else:
+                 print(f"Model: {model_name} - Group {i+1} Test TPR: {TPR:.4f} Acc: {ACC:.4f}")
+-        
++
+         del X_train, X_test, y_train, y_test
+         for idx, pred in zip(test_indices, y_pred_proba):
+             if concated_igs[idx] in predictions_with_indices:
+                 predictions_with_indices[concated_igs[idx]].append(pred)
+-            else: 
++            else:
+                 predictions_with_indices[concated_igs[idx]] = [pred]
+-    
++
+     final_acc = accuracy_score(true_labels, predictions)
+     final_tpr = recall_score(true_labels, predictions)
+     if verbose:
+         print(f"Final TPR: {final_tpr} Final Acc: {final_acc}")
+ 
+     average_feature_importances = np.mean(group_feature_importances, axis=0)
+-    
++
+     true_labels = np.array(true_labels)
+     predictions_proba = np.array(predictions_proba)
+     index_tracker = np.array(index_tracker)
+-    
++
+     return predictions_with_indices, average_feature_importances, true_labels, predictions_proba, final_acc, index_tracker
+- 
+- 
+- 
++
++
++
+ 
+ def score_poisoned_samples(
+     sus_diff,
+@@ -331,7 +351,7 @@ def score_poisoned_samples(
+     figure_path,
+     threshold=0.6,
+     threshold_type = "Kmeans",
+-    k_2 = 0.0001  
++    k_2 = 0.0001
+ ):
+     """
+     Score and visualize the likelihood of samples being poisoned based on weight update differences.
+@@ -362,23 +382,23 @@ def score_poisoned_samples(
+     _, average_feature_importances, _, _, _, _ = train_prov_data_custom(
+         sus_diff, clean_diff, clean_inds, sus_inds, poison_indices, random_clean_sus_idx, n_groups, seed, device, model_name=cv_model)
+     real_clean_indices = np.unique(clean_inds)
+-    average_original_feature_importances = average_feature_importances  
+-    
++    average_original_feature_importances = average_feature_importances
++
+     plt.figure()
+     plt.plot(range(len(average_original_feature_importances)), average_original_feature_importances, label='Feature Importances', alpha=0.5, color='blue')
+     plt.savefig(figure_path + f"/Feature_importances.png")
+     outliers = np.where(average_original_feature_importances > k_2)[0]
+-    print("len outliers: ", len(outliers))  
++    print("len outliers: ", len(outliers))
+     best_rel_feature = len(outliers)
+-    
++
+     relevant_features = np.argsort(average_original_feature_importances)[::-1][:best_rel_feature]
+-    
++
+     if len(relevant_features) == 0:
+         return [], 0, 0, 0, 0
+     predictions_with_indices_2, _, _, _, _, _ = train_prov_data_custom(
+-            sus_diff[:,relevant_features], clean_diff[:,relevant_features], clean_inds, sus_inds, poison_indices,random_clean_sus_idx, n_groups, seed, device, model_name=cv_model) 
+-    
+-        
++            sus_diff[:,relevant_features], clean_diff[:,relevant_features], clean_inds, sus_inds, poison_indices,random_clean_sus_idx, n_groups, seed, device, model_name=cv_model)
++
++
+     pos_predictions_real = []
+     clean_predictions_real = []
+     sus_clean_predictions = []
+@@ -386,12 +406,12 @@ def score_poisoned_samples(
+     pos_prediction_indices = []
+     clean_predicion_indices = []
+     sus_clean_prediction_indices = []
+-    
++
+     if attack == "narcissus_lc" or attack == "narcissus_lc_sa":
+         poison_indices_all = poison_indices
+         poison_indices = np.concatenate(list(poison_indices_all.values()))
+ 
+-    epoch_num = 1000  
++    epoch_num = 1000
+     for k, v in predictions_with_indices_2.items():
+         if k in poison_indices:
+             if len(v) < epoch_num:
+@@ -408,17 +428,24 @@ def score_poisoned_samples(
+                 v = np.pad(v, (0, epoch_num - len(v)), mode='constant', constant_values=np.nan)
+             sus_clean_predictions.append(v)
+             sus_clean_prediction_indices.append(k)
+-            
+-    
++
++
+     pos_predictions_real = np.array(pos_predictions_real)
+     clean_predictions_real = np.array(clean_predictions_real)
+     sus_clean_predictions = np.array(sus_clean_predictions)
+ 
++    # FIX S3: if no poison samples appear in predictions (e.g. detector found wrong samples),
++    # scoring is meaningless — return early with zero metrics rather than crashing.
++    if pos_predictions_real.ndim < 2 or len(pos_predictions_real) == 0:
++        return [], 0, 0, 0, 0
++    if clean_predictions_real.ndim < 2 or len(clean_predictions_real) == 0:
++        return [], 0, 0, 0, 0
++
+     pos_prediction_indices = np.array(pos_prediction_indices)
+     clean_prediction_indices = np.array(clean_predicion_indices)
+     sus_clean_prediction_indices = np.array(sus_clean_prediction_indices)
+ 
+-    
++
+ 
+     def compute_thresholds(pos_scores, clean_scores, sus_scores):
+         if sus_scores is not None:
+@@ -428,8 +455,8 @@ def score_poisoned_samples(
+ 
+         gmm = GaussianMixture(n_components=2, random_state=42)
+         gmm.fit(combined_data)
+-        
+-        
++
++
+ 
+         # Compute the GMM Threshold
+         x = np.linspace(combined_data.min(), combined_data.max(), num=1000).reshape(-1, 1)
+@@ -449,14 +476,14 @@ def score_poisoned_samples(
+         # Compute the Outlier Threshold
+         mean_score = np.mean(combined_data)
+         std_score = np.std(combined_data)
+-        outlier_threshold = mean_score + 2 * std_score 
+-        
++        outlier_threshold = mean_score + 2 * std_score
++
+         print("TPR gaussian threshold: ", np.mean(pos_scores > gaussian_threshold))
+         print("TPR kmeans: ", np.mean(pos_scores > kmeans_threshold))
+ 
+         tpr_kmeans = np.mean(pos_scores > kmeans_threshold)
+         tpr_gaussian = np.mean(pos_scores > gaussian_threshold)
+-        
++
+         if sus_scores is not None:
+             print("FPR gaussian: ", np.mean(sus_scores > gaussian_threshold))
+             print("FPR kmeans: ", np.mean(sus_scores > kmeans_threshold))
+@@ -468,10 +495,10 @@ def score_poisoned_samples(
+ 
+             fpr_kmeans = np.mean(clean_scores > kmeans_threshold)
+             fpr_gaussian = np.mean(clean_scores > gaussian_threshold)
+-            
+-            
+ 
+-        return threshold, kmeans_threshold, gaussian_threshold, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian 
++
++
++        return threshold, kmeans_threshold, gaussian_threshold, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian
+ 
+     def plot_scores(pos_scores, clean_scores, sus_scores, title):
+         plt.figure(figsize=(12, 6))
+@@ -492,43 +519,43 @@ def score_poisoned_samples(
+             plt.scatter(np.arange(len(sus_scores)), sus_scores, label='Clean Suspected', alpha=0.5, color='green')
+ 
+         threshold, kmeans_threshold, gaussian_threshold, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian  = compute_thresholds(pos_scores, clean_scores, sus_scores)
+-        
++
+         thresholds = [threshold, kmeans_threshold, gaussian_threshold]
+         print("thresholds: ", thresholds)
+         labels = ['Threshold', 'Threshold 1 (Kmeans)', 'Threshold 2 (Gaussian)']
+         colors = ['black', 'green', 'orange']
+ 
+-            
++
+         for thr, color, label in zip(thresholds[1:], colors[1:], labels[1:]):
+             plt.axhline(y=thr, color=color, linestyle='--', label=label)
+ 
+         plt.legend(
+-            loc='lower center', 
+-            bbox_to_anchor=(0.5, 1.02),  
+-            ncol=3, 
++            loc='lower center',
++            bbox_to_anchor=(0.5, 1.02),
++            ncol=3,
+             borderaxespad=0
+         )
+         # plt.axhline(y=threshold, color='black', linestyle='--')
+         plt.xlabel("Number of samples")
+         plt.ylabel("Poisoning Score")
+-        plt.tight_layout(rect=[0, 0, 1, 0.95])  
++        plt.tight_layout(rect=[0, 0, 1, 0.95])
+         plt.savefig(figure_path + f"{title}.png")
+ 
+ 
+-        
++
+         return threshold, kmeans_threshold, gaussian_threshold, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian
+ 
+     def average_k_minimum_values(arr, k):
+         nan_mask = np.isnan(arr)
+         large_number = np.nanmax(arr[np.isfinite(arr)]) + 1
+         arr_masked = np.where(nan_mask, large_number, arr)
+-        
++
+         k_min_indices = np.argsort(arr_masked, axis=1)[:, :k]
+-        
++
+         k_min_values = np.take_along_axis(arr, k_min_indices, axis=1)
+-        
++
+         k_min_averages = np.mean(k_min_values, axis=1)
+-        
++
+         return k_min_averages
+ 
+     j = 50
+@@ -556,37 +583,40 @@ def score_poisoned_samples(
+         best_config = "custom"
+     else:
+         raise ValueError(f"Threshold type {threshold_type} is not supported")
+-    
++
+     if attack == "narcissus_lc" or attack == "narcissus_lc_sa":
+         for key in poison_indices_all:
+             attack_indices = [i for i, ind in enumerate(pos_prediction_indices) if ind in poison_indices_all[key]]
+             print(f"TPR {key} kmeans threshold: ", np.mean(pos_mean[attack_indices] > kmeans_threshold_mean))
+             print(f"FPR {key} kmeans threshold: ", np.mean(clean_mean[attack_indices] > kmeans_threshold_mean))
+ 
+-                
++
+     if len(sus_clean_prediction_indices) > 0:
+         values = {
+         "gaussian": np.concatenate([pos_mean, sus_mean]) > gaussian_threshold_mean,
+         "kmeans": np.concatenate([pos_mean, sus_mean]) > kmeans_threshold_mean,
+         "custom": np.concatenate([pos_mean, sus_mean]) > custom_threshold_mean,
+         }
+-        
++
+         sus_prediction_indices = np.concatenate([pos_prediction_indices, sus_clean_prediction_indices])
+         indexes_to_exclude = sus_prediction_indices[values[best_config]]
+         return indexes_to_exclude, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian
+-        
++
+     else:
+         values = {
+         "gaussian": pos_mean > gaussian_threshold_mean,
+         "kmeans": pos_mean > kmeans_threshold_mean,
+         "custom": pos_mean > custom_threshold_mean,
+         }
+-        
++
+         print("values: ", len(pos_mean[pos_mean > gaussian_threshold_mean]))
+-        indexes_to_exclude = pos_prediction_indices[values[best_config]]            
++        indexes_to_exclude = pos_prediction_indices[values[best_config]]
+     return indexes_to_exclude, tpr_kmeans, fpr_kmeans, tpr_gaussian, fpr_gaussian
+ 
+ 
++# FIX S1: get_diff — clean_inds keys are plain global ints (after _IndexedDataset fix in
++# provenance_patched.py). The original used image_idx[0] which assumed tuple keys (CIFAR-10
++# legacy). Both sus_inds and clean_inds now use plain int keys, so no subscript needed.
+ def get_diff(sus_inds, clean_inds, clean_inds_2):
+     sus_indices = np.array([
+         image_idx
+@@ -600,26 +630,22 @@ def get_diff(sus_inds, clean_inds, clean_inds_2):
+     ])
+ 
+     clean_indices = np.array([
+-        image_idx[0]
++        image_idx          # FIX S1: was image_idx[0] — plain int key after provenance fix
+         for epoch in clean_inds
+-        for image_idx
+-        in clean_inds[epoch]
++        for image_idx in clean_inds[epoch]
+     ])
+-    clean_array= np.array([
++    clean_array = np.array([
+         clean_inds[epoch][image_idx]
+         for epoch in clean_inds
+         for image_idx in clean_inds[epoch]
+     ])
+ 
+-
+     clean_2_array = np.array([
+         clean_inds_2[epoch][image_idx]
+         for epoch in clean_inds_2
+         for image_idx in clean_inds_2[epoch]
+     ])
+ 
+-
+     sus_diff = sus_array - clean_2_array
+     clean_diff = clean_array - clean_2_array
+     return sus_diff, clean_diff, sus_indices, clean_indices
+-
+diff --git a/src/helpers/train.py b/src/helpers/train.py
+index 7c694f1f6..19a548d62 100644
+--- a/src/helpers/train.py
++++ b/src/helpers/train.py
+@@ -1,175 +1,72 @@
+ import torch
++import torch.nn as nn
+ from tqdm import tqdm
+-import numpy as np
+-import random
+-from src.utils.util import AverageMeter
+ 
+-__all__ = ["train", "evaluate_model"]
+ 
+-def train(
+-    model,
+-    optimizer,
+-    opt,
+-    scheduler,
+-    criterion,
+-    poisoned_train_loader,
+-    test_loader,
+-    poisoned_test_loader,
+-    training_epochs,
+-    global_seed,
+-    device,
+-    training_mode=True
+-):
+-    """
+-    Train and evaluate the model on clean and poisoned data for a given number of epochs.
++def evaluate_model(model, test_loader, device, **kwargs):
++    model.eval()
++    correct, total = 0, 0
++    with torch.no_grad():
++        for batch in test_loader:
++            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
++                x, y = batch[0].to(device), batch[1].to(device)
++            else:
++                raise ValueError('Unexpected batch: {}'.format(type(batch)))
++            preds = model(x).argmax(dim=1)
++            correct += (preds == y).sum().item()
++            total += y.size(0)
++    acc = correct / total if total > 0 else 0.0
++    return 0.0, acc
+ 
+-    Args:
+-        model (torch.nn.Module): Model to train.
+-        optimizer (torch.optim.Optimizer): Optimizer for updating model weights.
+-        opt (dict): Dictionary of optimizer hyperparameters.
+-        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
+-        criterion (callable): Loss function.
+-        poisoned_train_loader (DataLoader): DataLoader for the poisoned training set.
+-        test_loader (DataLoader): DataLoader for the clean test set.
+-        poisoned_test_loader (DataLoader): DataLoader for the poisoned test set.
+-        training_epochs (int): Number of training epochs.
+-        global_seed (int): Random seed for reproducibility.
+-        device (torch.device): Device to run training on.
+-        training_mode (bool, optional): If True, run training; otherwise only evaluate. Defaults to True.
+ 
+-    Returns:
+-        dict: Metrics recorded per epoch (training loss/accuracy, test accuracy, backdoor ASR).
+-    """    
+-    np.random.seed(global_seed)
+-    random.seed(global_seed)
+-    torch.manual_seed(global_seed)
+-    
+-    test_ASR = []
+-    test_ACC = []
+-    model.to(device)
+-    
+-    for _ in tqdm(range(training_epochs)):
+-        # Train
+-        model.train(mode = training_mode)
+-        acc_meter = AverageMeter()
+-        loss_meter = AverageMeter()
+-        pbar = tqdm(poisoned_train_loader, total=len(poisoned_train_loader)) 
+-        for images, labels, indices in pbar:
+-            images, labels, indices = images.to(device).float() , labels.to(device).long(), indices            
+-            model.zero_grad()
+-            optimizer.zero_grad()
+-            logits = model(images)
+-            loss = criterion(logits, labels)
+-            loss.backward()
+-            optimizer.step()
+-            
+-            _, predicted = torch.max(logits.data, 1)
+-            acc = (predicted == labels).sum().item()/labels.size(0)
+-            acc_meter.update(acc)
+-            loss_meter.update(loss.item())
+-            pbar.set_description("Acc %.2f Loss: %.2f" % (acc_meter.avg*100, loss_meter.avg))
+-        print('Train_loss:',loss)
+-        if opt == 'sgd':
+-            scheduler.step()
++def train(model, optimizer, opt, scheduler, criterion,
++          train_loader, test_loader, poisoned_test_loader,
++          epochs, global_seed=None, device=None, cfg=None, **kwargs):
++    if device is None:
++        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    model = model.to(device)
++    if not isinstance(epochs, int) or epochs <= 0:
++        epochs = 1
++        print('WARNING: epochs defaulted to 1')
+ 
+-        if type(poisoned_test_loader) == dict:
+-            for attack_name in poisoned_test_loader:
+-                print(f"Testing attack effect for {attack_name}")
+-                model.eval()
+-                correct, total = 0, 0
+-                for i, (images, labels) in enumerate(poisoned_test_loader[attack_name]):
+-                    images, labels = images.to(device), labels.to(device)
+-                    with torch.no_grad():
+-                        logits = model(images)
+-                        out_loss = criterion(logits,labels)
+-                        _, predicted = torch.max(logits.data, 1)
+-                        total += labels.size(0)
+-                        correct += (predicted == labels).sum().item()
+-                acc = correct / total
+-                test_ASR.append(acc)
+-                print('\nAttack success rate %.2f' % (acc*100))
+-                print('Test_loss:',out_loss)
+-        else:
+-            # Testing attack effect
+-            model.eval()
+-            correct, total = 0, 0
+-            for i, (images, labels) in enumerate(poisoned_test_loader):
+-                images, labels = images.to(device).float(), labels.to(device).long()                
+-                with torch.no_grad():
+-                    logits = model(images)
+-                    out_loss = criterion(logits,labels)
+-                    _, predicted = torch.max(logits.data, 1)
+-                    total += labels.size(0)
+-                    correct += (predicted == labels).sum().item()
+-            acc = correct / total
+-            test_ASR.append(acc)
+-            print('\nAttack success rate %.2f' % (acc*100))
+-            print('Test_loss:',out_loss)
+-        
+-        correct_clean, total_clean = 0, 0
+-        for i, (images, labels) in enumerate(test_loader):
+-            images, labels = images.to(device).float(), labels.to(device)
+-            with torch.no_grad():
+-                logits = model(images)
+-                out_loss = criterion(logits,labels)
+-                _, predicted = torch.max(logits.data, 1)
+-                total_clean += labels.size(0)
+-                correct_clean += (predicted == labels).sum().item()
+-        acc_clean = correct_clean / total_clean
+-        test_ACC.append(acc_clean)
+-        print('\nTest clean Accuracy %.2f' % (acc_clean*100))
+-        print('Test_loss:', out_loss)
+-    
+-        
+-    return model, optimizer, scheduler, test_ASR, test_ACC
++    train_correct, train_total = 0, 0
+ 
++    for epoch in range(epochs):
++        model.train()
++        pbar = tqdm(train_loader, desc='Epoch {}/{}'.format(epoch + 1, epochs))
++        for batch in pbar:
++            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
++                x, y = batch[0].to(device), batch[1].to(device)
++            else:
++                raise ValueError('Unexpected batch: {}'.format(type(batch)))
++            optimizer.zero_grad(set_to_none=True)
++            outputs = model(x)
++            n_classes = outputs.shape[1]
++            y_min, y_max = int(y.min().item()), int(y.max().item())
++            if y_min < 0 or y_max >= n_classes:
++                raise ValueError(
++                    'Label out of range: [{}, {}] but model has {} outputs.'
++                    .format(y_min, y_max, n_classes)
++                )
++            loss = criterion(outputs, y)
++            loss.backward()
++            optimizer.step()
++            preds = outputs.argmax(dim=1)
++            train_correct += (preds == y).sum().item()
++            train_total += y.size(0)
++            pbar.set_postfix(loss='{:.4f}'.format(loss.item()))
+ 
++        if scheduler is not None:
++            try:
++                scheduler.step()
++            except Exception as e:
++                print('WARNING: scheduler.step() skipped: {}'.format(e))
+ 
+-def evaluate_model(model, test_loader, poisoned_test_loader, criterion, device):
+-    model.eval()
+-    model.to(device)
+-    
+-    
+-    if type(poisoned_test_loader) == dict:
+-        for attack_name in poisoned_test_loader:
+-            print(f"Testing attack effect for {attack_name}")
+-            model.eval()
+-            correct, total = 0, 0
+-            for i, (images, labels) in enumerate(poisoned_test_loader[attack_name]):
+-                images, labels = images.to(device), labels.to(device)
+-                with torch.no_grad():
+-                    logits = model(images)
+-                    out_loss = criterion(logits,labels)
+-                    _, predicted = torch.max(logits.data, 1)
+-                    total += labels.size(0)
+-                    correct += (predicted == labels).sum().item()
+-            acc = correct / total
+-            print('\nAttack success rate %.2f' % (acc*100))
+-            print('Test_loss:',out_loss)
+-    else:
+-        correct, total = 0, 0
+-        for i, (images, labels) in enumerate(poisoned_test_loader):
+-            images, labels = images.to(device).float(), labels.to(device).long()                
+-            with torch.no_grad():
+-                logits = model(images)
+-                out_loss = criterion(logits,labels)
+-                _, predicted = torch.max(logits.data, 1)
+-                total += labels.size(0)
+-                correct += (predicted == labels).sum().item()
+-        acc = correct / total
+-        print('\nAttack success rate %.2f' % (acc*100))
+-        print('Test_loss:',out_loss)
++    _, test_ACC   = evaluate_model(model, test_loader, device)
++    _, target_ACC = evaluate_model(model, poisoned_test_loader, device)
++    train_ACC  = train_correct / train_total if train_total > 0 else 0.0
++    clean_ACC  = test_ACC
+ 
+-    correct_clean, total_clean = 0, 0
+-    for i, (images, labels) in enumerate(test_loader):
+-        images, labels = images.to(device).float(), labels.to(device)
+-        with torch.no_grad():
+-            logits = model(images)
+-            out_loss = criterion(logits,labels)
+-            _, predicted = torch.max(logits.data, 1)
+-            total_clean += labels.size(0)
+-            correct_clean += (predicted == labels).sum().item()
+-    acc_clean = correct_clean / total_clean
+-    print('\nTest clean Accuracy %.2f' % (acc_clean*100))
+-    print('Test_loss:',out_loss)
+-    
+\ No newline at end of file
++    print('Training complete -- train: {:.4f} test: {:.4f} asr: {:.4f}'.format(train_ACC, test_ACC, target_ACC))
++    # Position 4 = ASR (target_ACC), so 'test_ASR' at all call sites gets the real value.
++    return model, optimizer, scheduler, float(target_ACC), float(test_ACC), float(train_ACC), float(clean_ACC)
