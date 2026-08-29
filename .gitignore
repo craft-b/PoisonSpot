@@ -1,0 +1,23 @@
+# Run outputs — regenerable, and large
+smoke_out/
+smoke_data/
+outputs/saved_models/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.bak
+
+# Environment
+.venv/
+venv/
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+.vscode/
+.idea/
